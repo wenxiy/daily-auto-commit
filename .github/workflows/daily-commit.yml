@@ -1,0 +1,29 @@
+name: Daily Auto Commit
+
+on:
+  schedule:
+    - cron: '0 22 * * *'  # 每天 UTC 时间 22 点
+  workflow_dispatch:
+
+jobs:
+  auto-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Write update log
+        run: |
+          echo "Updated on $(date)" > update.log
+
+      - name: Commit and push
+        run: |
+          git add update.log
+          git commit -m "🕒 Daily update on $(date -u '+%Y-%m-%d %H:%M:%S') UTC" || echo "Nothing to commit"
+          git push
