@@ -1,11 +1,9 @@
-name: Daily Auto Commit
+name: Daily Auto Commit (randomized)
 
 on:
   schedule:
-    - cron: '0 22 * * *'  # 每天 UTC 时间 22:00，即北京时间早上 6 点
-    - cron: '0 4 * * *'   # 北京时间 12:00
-    - cron: '0 10 * * *'  # 北京时间 18:00
-  workflow_dispatch:      # 允许手动触发
+    - cron: '0 * * * *'      # 每小时触发一次（UTC）
+  workflow_dispatch:          # 允许手动触发
 
 jobs:
   auto-commit:
@@ -14,6 +12,77 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # 需要读取 update.log 的历史以计算“3 天内必触发”
+
+      - name: Decide whether to run this hour
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # -------- 配置：随机范围与强制阈值 --------
+          MIN_PER_DAY=0
+          MAX_PER_DAY=5               # 每天随机 0..5 次
+          FORCE_WITHIN_HOURS=$((72))  # 三天 = 72 小时，超时强制执行
+
+          # -------- 计算今天的随机次数 N（0..5，按日期+仓库确定性随机）--------
+          DAY_KEY="$(date -u +%Y-%m-%d)"
+          SEED="$(printf '%s:%s' "$DAY_KEY" "${{ github.repository }}")"
+          HSH="$(printf '%s' "$SEED" | sha256sum | cut -d' ' -f1)"
+          N=$(( 0x${HSH:0:2} % (MAX_PER_DAY - MIN_PER_DAY + 1) + MIN_PER_DAY ))
+
+          # -------- 从哈希中派生出 N 个不重复的小时（0..23）--------
+          declare -A PICK=()
+          i=2
+          while [ "${#PICK[@]}" -lt "$N" ]; do
+            b=${HSH:$i:2}
+            # 若哈希用尽，重新哈希加盐
+            if [ -z "$b" ]; then
+              HSH="$(printf '%s+' "$HSH" | sha256sum | cut -d' ' -f1)"
+              i=2
+              continue
+            fi
+            h=$(( 0x$b % 24 ))
+            PICK[$h]=1
+            i=$(( i + 2 ))
+          done
+
+          CUR_HOUR_UTC=$(date -u +%H)     # 00..23
+          SHOULD_RUN_THIS_HOUR=0
+          if [ "$N" -gt 0 ] && [ "${PICK[$((10#$CUR_HOUR_UTC))]+x}" = "x" ]; then
+            SHOULD_RUN_THIS_HOUR=1
+          fi
+
+          # -------- 读取 update.log 最近一次提交时间（秒）--------
+          LAST_TS=0
+          if git ls-files --error-unmatch update.log >/dev/null 2>&1; then
+            if git log -1 --format=%ct -- update.log >/dev/null 2>&1; then
+              LAST_TS=$(git log -1 --format=%ct -- update.log || echo 0)
+            fi
+          else
+            # 文件不存在，首次运行时强制执行一次以创建
+            LAST_TS=0
+          fi
+
+          NOW_TS=$(date -u +%s)
+          HOURS_SINCE=$(( (NOW_TS - LAST_TS) / 3600 ))
+
+          FORCE_RUN=0
+          if [ "$HOURS_SINCE" -ge "$FORCE_WITHIN_HOURS" ]; then
+            FORCE_RUN=1
+          fi
+
+          DO_RUN=$(( SHOULD_RUN_THIS_HOUR || FORCE_RUN ))
+          echo "Random picks today (UTC hours): ${!PICK[*]}"
+          echo "N=$N, CUR_HOUR=$CUR_HOUR_UTC, SHOULD_RUN=$SHOULD_RUN_THIS_HOUR, FORCE_RUN=$FORCE_RUN, HOURS_SINCE_LAST=$HOURS_SINCE"
+          echo "do_run=$DO_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if not selected to run
+        if: steps.decide.outputs.do_run == '0'
+        run: |
+          echo "⏭️ Skipping this hour (not in today's random picks and within 72h)."
+          exit 0
 
       - name: Set git identity
         run: |
@@ -27,7 +96,18 @@ jobs:
       - name: Commit and push
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
           git add update.log
-          git commit -m "🕒 Daily update on $(date -u '+%Y-%m-%d %H:%M:%S') UTC" || echo "Nothing to commit"
-          git push https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git HEAD:main
+          git commit -m "🕒 Randomized update on $(date -u '+%Y-%m-%d %H:%M:%S') UTC" || { echo "Nothing to commit"; exit 0; }
+
+          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          # 兼容部分场景下 HEAD 为 'HEAD'（detached），则回退到默认分支 main/master 之一
+          if [ "$BRANCH" = "HEAD" ]; then
+            if git show-ref --verify --quiet refs/heads/main; then BRANCH=main;
+            elif git show-ref --verify --quiet refs/heads/master; then BRANCH=master;
+            else BRANCH="$(git branch --show-current)"; fi
+          fi
+
+          git push "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${BRANCH}"
