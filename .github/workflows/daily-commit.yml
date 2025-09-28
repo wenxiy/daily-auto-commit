@@ -1,12 +1,29 @@
+name: Daily Auto Commit (randomized)
+
+on:
+  schedule:
+    - cron: '0 * * * *'     # 每小时（UTC）检查一次
+  workflow_dispatch:         # 允许手动触发
+
+jobs:
+  auto-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
       - name: Decide whether to run this hour
         id: decide
         shell: bash
         run: |
           set -euo pipefail
 
-          # ========== 配置 ==========
-          FORCE_WITHIN_HOURS=72   # 3天未触发强制执行
-          # =========================
+          # ===== 配置 =====
+          FORCE_WITHIN_HOURS=72   # 3 天未提交 => 强制执行
+          # =================
 
           DAY_KEY="$(date -u +%Y-%m-%d)"
           CUR_HOUR_UTC=$(date -u +%H)  # 00..23
@@ -14,12 +31,11 @@
           SEED="${DAY_KEY}:${REPO}"
           HSH="$(printf '%s' "$SEED" | sha256sum | cut -d' ' -f1)"
 
-          # -------- “隔天触发”判定（按 UTC 日期奇偶）--------
-          # 允许日：基于“自 1970-01-01 的天数”偶数日；不想从 epoch 起算可换成 %j(年内第几天)。
+          # --- 隔天触发：按自 epoch 的天数奇偶 ---
           DAYS_SINCE_EPOCH=$(( $(date -u +%s) / 86400 ))
           ALLOW_TODAY=$(( (DAYS_SINCE_EPOCH % 2) == 0 ? 1 : 0 ))
 
-          # -------- 读取 update.log 最近一次提交时间（秒）--------
+          # --- 最近一次 update.log 的提交时间 ---
           LAST_TS=0
           if git ls-files --error-unmatch update.log >/dev/null 2>&1; then
             if git log -1 --format=%ct -- update.log >/dev/null 2>&1; then
@@ -30,25 +46,25 @@
           NOW_TS=$(date -u +%s)
           HOURS_SINCE=$(( (NOW_TS - LAST_TS) / 3600 ))
 
-          # -------- 强制执行：72 小时未提交 --------
+          # --- 72 小时强制 ---
           FORCE_RUN=0
           if [ "$HOURS_SINCE" -ge "$FORCE_WITHIN_HOURS" ]; then
             FORCE_RUN=1
           fi
 
-          # -------- 计算“今天最多触发次数 N”：允许日 = 1 次 + 50% 概率再加 1 次；非允许日 = 0 次 --------
-          # 用哈希第二个字节偶奇决定是否涨到 2 次（50% 概率）
+          # --- 当天最多触发次数 N ---
+          # 允许日：默认 1 次；50% 概率升到 2 次；非允许日：0 次
           if [ "$ALLOW_TODAY" -eq 1 ]; then
             N=1
             BYTE2=$(( 0x${HSH:2:2} ))
             if [ $(( BYTE2 % 2 )) -eq 0 ]; then
-              N=$(( N + 1 ))   # 以 50% 概率升级到 2 次
+              N=$(( N + 1 ))
             fi
           else
             N=0
           fi
 
-          # -------- 从哈希派生出 N 个不重复小时（0..23）--------
+          # --- 从哈希派生出 N 个不重复的小时 ---
           declare -A PICK=()
           i=4
           while [ "${#PICK[@]}" -lt "$N" ]; do
@@ -63,24 +79,20 @@
             i=$(( i + 2 ))
           done
 
-          # -------- 统计“今天已提交次数”（仅统计 update.log）--------
+          # --- 统计今天对 update.log 的提交次数 ---
           TODAY_BEGIN="$(date -u -d "$(date -u +%Y-%m-%d) 00:00:00" +%s)"
           TODAY_COMMITS=0
           if git ls-files --error-unmatch update.log >/dev/null 2>&1; then
-            # 过滤今天以来对 update.log 的提交计数
             TODAY_COMMITS=$(git log --since="@${TODAY_BEGIN}" --format='%H' -- update.log | wc -l | tr -d ' ')
           fi
 
-          # -------- 本小时是否在随机挑选小时内 --------
+          # --- 本小时是否是选中的随机小时 ---
           SHOULD_RUN_THIS_HOUR=0
           if [ "$N" -gt 0 ] && [ "${PICK[$((10#$CUR_HOUR_UTC))]+x}" = "x" ]; then
             SHOULD_RUN_THIS_HOUR=1
           fi
 
-          # -------- 最终是否执行 --------
-          # 规则：
-          # 1) 若强制执行（>=72h），则 DO_RUN=1（无视隔天与计数/小时）
-          # 2) 否则需满足：允许日 & 在挑选小时 & 今日提交数 < N
+          # --- 最终执行判定 ---
           DO_RUN=0
           if [ "$FORCE_RUN" -eq 1 ]; then
             DO_RUN=1
@@ -90,8 +102,38 @@
             fi
           fi
 
-          # 输出调试信息与结果
-          echo "ALLOW_TODAY=$ALLOW_TODAY (even-day UTC), N=$N, CUR_HOUR=$CUR_HOUR_UTC"
+          echo "ALLOW_TODAY=$ALLOW_TODAY, N=$N, CUR_HOUR=$CUR_HOUR_UTC"
           echo "Random picks (UTC hours): ${!PICK[*]}"
           echo "TODAY_COMMITS=$TODAY_COMMITS, FORCE_RUN=$FORCE_RUN, HOURS_SINCE_LAST=$HOURS_SINCE"
           echo "do_run=$DO_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if not selected to run
+        if: steps.decide.outputs.do_run == '0'
+        run: |
+          echo "⏭️ Skip: not selected (and within 72h)."
+          exit 0
+
+      - name: Set git identity
+        run: |
+          git config --global user.name "wenxiy"
+          git config --global user.email "193367189@qq.com"
+
+      - name: Write update log
+        run: |
+          echo "Updated on $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> update.log
+
+      - name: Commit and push
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add update.log
+          git commit -m "🕒 Randomized update on $(date -u '+%Y-%m-%d %H:%M:%S') UTC" || { echo "Nothing to commit"; exit 0; }
+          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          if [ "$BRANCH" = "HEAD" ]; then
+            if git show-ref --verify --quiet refs/heads/main; then BRANCH=main;
+            elif git show-ref --verify --quiet refs/heads/master; then BRANCH=master;
+            else BRANCH="$(git branch --show-current)"; fi
+          fi
+          git push "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${BRANCH}"
