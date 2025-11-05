@@ -22,7 +22,7 @@ jobs:
           set -euo pipefail
 
           # ===== 配置 =====
-          FORCE_WITHIN_HOURS=72   # 3 天未提交 => 强制执行
+          FORCE_WITHIN_HOURS=72    # 3 天未提交 => 强制执行
           # =================
 
           DAY_KEY="$(date -u +%Y-%m-%d)"
@@ -31,9 +31,19 @@ jobs:
           SEED="${DAY_KEY}:${REPO}"
           HSH="$(printf '%s' "$SEED" | sha256sum | cut -d' ' -f1)"
 
-          # --- 隔天触发：按自 epoch 的天数奇偶 ---
+          # --- 新的 4天周期：1, 2, 1, 3 次提交 ---
           DAYS_SINCE_EPOCH=$(( $(date -u +%s) / 86400 ))
-          ALLOW_TODAY=$(( (DAYS_SINCE_EPOCH % 2) == 0 ? 1 : 0 ))
+          CYCLE_DAY=$(( DAYS_SINCE_EPOCH % 4 )) # 0, 1, 2, 3 (从 epoch 以来天数对 4 取模)
+
+          N=0
+          if [ "$CYCLE_DAY" -eq 0 ] || [ "$CYCLE_DAY" -eq 2 ]; then
+            N=1 # 第 1, 3 天（周期日 0, 2）：提交 1 次
+          elif [ "$CYCLE_DAY" -eq 1 ]; then
+            N=2 # 第 2 天（周期日 1）：提交 2 次
+          elif [ "$CYCLE_DAY" -eq 3 ]; then
+            N=3 # 第 4 天（周期日 3）：提交 3 次
+          fi
+          # N (当天最多触发次数) 现在已被设置为 1, 2, 或 3。
 
           # --- 最近一次 update.log 的提交时间 ---
           LAST_TS=0
@@ -50,18 +60,6 @@ jobs:
           FORCE_RUN=0
           if [ "$HOURS_SINCE" -ge "$FORCE_WITHIN_HOURS" ]; then
             FORCE_RUN=1
-          fi
-
-          # --- 当天最多触发次数 N ---
-          # 允许日：默认 1 次；50% 概率升到 2 次；非允许日：0 次
-          if [ "$ALLOW_TODAY" -eq 1 ]; then
-            N=1
-            BYTE2=$(( 0x${HSH:2:2} ))
-            if [ $(( BYTE2 % 2 )) -eq 0 ]; then
-              N=$(( N + 1 ))
-            fi
-          else
-            N=0
           fi
 
           # --- 从哈希派生出 N 个不重复的小时 ---
@@ -97,12 +95,13 @@ jobs:
           if [ "$FORCE_RUN" -eq 1 ]; then
             DO_RUN=1
           else
-            if [ "$ALLOW_TODAY" -eq 1 ] && [ "$SHOULD_RUN_THIS_HOUR" -eq 1 ] && [ "$TODAY_COMMITS" -lt "$N" ]; then
+            # 只要是选中的随机小时，且今日提交次数未达到 N，就运行。
+            if [ "$SHOULD_RUN_THIS_HOUR" -eq 1 ] && [ "$TODAY_COMMITS" -lt "$N" ]; then
               DO_RUN=1
             fi
           fi
 
-          echo "ALLOW_TODAY=$ALLOW_TODAY, N=$N, CUR_HOUR=$CUR_HOUR_UTC"
+          echo "CYCLE_DAY=$CYCLE_DAY, N=$N, CUR_HOUR=$CUR_HOUR_UTC"
           echo "Random picks (UTC hours): ${!PICK[*]}"
           echo "TODAY_COMMITS=$TODAY_COMMITS, FORCE_RUN=$FORCE_RUN, HOURS_SINCE_LAST=$HOURS_SINCE"
           echo "do_run=$DO_RUN" >> "$GITHUB_OUTPUT"
